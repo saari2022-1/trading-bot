@@ -4,16 +4,21 @@ const fs = require('fs');
 const path = require('path');
 
 const token = '8871928848:AAGuRrN_0IFxcq0sU0JitXhCKPK_1QGNXn0';
+const userId = '709023711';
 const bot = new TelegramBot(token, { polling: true });
 
-// ===== إعدادات الأسواق =====
+// ===== حالة الإرسال التلقائي =====
+let autoSendEnabled = true;  // يبدأ مفعلاً تلقائياً
+let lastSentOpportunities = [];
+let isFirstRun = true;
+
+// ===== باقي الإعدادات =====
 let marketSettings = { stocks: true, crypto: true };
 let stockList = [];
 let cryptoList = [];
 let allOpportunities = [];
 let signalsHistory = [];
 
-// ===== تحميل سجل الإشارات السابقة =====
 const HISTORY_FILE = path.join(__dirname, 'signals_history.json');
 function loadHistory() {
     try {
@@ -29,7 +34,6 @@ function saveHistory() {
 }
 loadHistory();
 
-// ===== قائمة الأسهم المحرمة =====
 const forbiddenStocks = [
     'BAC', 'JPM', 'C', 'WFC', 'GS', 'MS', 'V', 'MA', 'AXP',
     'KO', 'PEP', 'STZ', 'BF.B', 'TAP',
@@ -37,7 +41,6 @@ const forbiddenStocks = [
     'PM', 'MO', 'BTI'
 ];
 
-// ===== دوال جلب البيانات =====
 async function fetchStockList() {
     try {
         const response = await axios.get('https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv');
@@ -107,12 +110,10 @@ function getPurification(symbol) {
     return { percentage: rates[symbol] || 0.5, isForbidden: false, reason: 'نشاط مختلط' };
 }
 
-// ===== نظام التقييم =====
 function calculateScore(data, news, symbol) {
     let score = 0;
     const details = [];
     
-    // 1. الأخبار (0-30)
     if (news.length > 0) {
         const titles = news.map(n => n.title.toLowerCase());
         const strongWords = ['beat', 'surge', 'breakthrough', 'record', 'excellent', 'outstanding', 'revolutionary', 'dominant'];
@@ -132,7 +133,6 @@ function calculateScore(data, news, symbol) {
         details.push(`📰 الأخبار: 0/30 (لا توجد أخبار)`);
     }
     
-    // 2. حجم التداول (0-25)
     const volumeRatio = data.volume / (data.volumeAvg || 1);
     let volumeScore = 0;
     if (volumeRatio > 5) volumeScore = 25;
@@ -142,22 +142,20 @@ function calculateScore(data, news, symbol) {
     score += volumeScore;
     details.push(`💧 حجم التداول: ${volumeScore}/25 (${volumeRatio.toFixed(2)}x)`);
     
-    // 3. الحركة السعرية (0-20)
     const isCrypto = symbol.includes('-USD');
     const sr = data.highPrice;
     const prevHigh = data.prevClose * 1.02;
     let priceScore = 0;
     if (data.lastPrice > prevHigh && data.lastPrice > data.highPrice * 0.98) {
-        priceScore = 20; // اختراق مقاومة
+        priceScore = 20;
     } else if (data.lastPrice > data.highPrice * 0.98) {
-        priceScore = 10; // قمة يومية
+        priceScore = 10;
     } else if (data.change > 1) {
-        priceScore = 5; // اتجاه صاعد
+        priceScore = 5;
     }
     score += priceScore;
     details.push(`📊 الحركة السعرية: ${priceScore}/20 (تغير ${data.change.toFixed(2)}%)`);
     
-    // 4. ما قبل الافتتاح (0-15) - للأسهم فقط
     let premarketScore = 0;
     if (!isCrypto) {
         const premarketChange = ((data.lastPrice - data.prevClose) / data.prevClose * 100);
@@ -170,7 +168,6 @@ function calculateScore(data, news, symbol) {
         details.push(`🌅 ما قبل الافتتاح: غير متاح للعملات المشفرة`);
     }
     
-    // 5. المحفزات (0-10)
     let catalystScore = 0;
     const titleLower = news.map(n => n.title.toLowerCase()).join(' ');
     const catalysts = ['earnings', 'profits', 'conference', 'investor', 'regulatory', 'approval', 'contract', 'agreement'];
@@ -181,7 +178,6 @@ function calculateScore(data, news, symbol) {
     score += catalystScore;
     details.push(`⚡ المحفزات: ${catalystScore}/10`);
     
-    // حساب التطهير
     const p = getPurification(symbol);
     if (p.isForbidden || p.percentage > 5) {
         score = Math.max(score - 20, 0);
@@ -190,14 +186,12 @@ function calculateScore(data, news, symbol) {
         details.push(`🕌 التطهير: معتمد (${p.percentage}%)`);
     }
     
-    // تحديد الفئة
     let category, confidence;
     if (score >= 80) { category = 'A (Strong Buy)'; confidence = 9; }
     else if (score >= 60) { category = 'B (Good)'; confidence = 7; }
     else if (score >= 40) { category = 'C (Watchlist)'; confidence = 5; }
     else { category = 'D (Monitor)'; confidence = 3; }
     
-    // حساب المخاطرة/العائد
     const entry = data.lastPrice * 0.98;
     const takeProfit = data.lastPrice * 1.04;
     const stopLoss = data.lastPrice * 0.95;
@@ -219,7 +213,6 @@ function calculateScore(data, news, symbol) {
     };
 }
 
-// ===== مسح السوق بالكامل =====
 async function scanMarket() {
     const allSymbols = [];
     const results = [];
@@ -235,7 +228,6 @@ async function scanMarket() {
     
     if (allSymbols.length === 0) return [];
     
-    // أخذ عينة عشوائية
     const shuffled = allSymbols.sort(() => 0.5 - Math.random());
     const selected = shuffled.slice(0, 50);
     
@@ -250,7 +242,6 @@ async function scanMarket() {
             const news = await getNews(symbol);
             const scored = calculateScore(data, news, symbol);
             
-            // تسجيل الإشارة في السجل
             signalsHistory.push({
                 timestamp: Date.now(),
                 symbol: scored.symbol,
@@ -270,46 +261,150 @@ async function scanMarket() {
     return results;
 }
 
-// ===== عرض أفضل الفرص =====
 function formatOpportunities(opportunities, limit = 20) {
     if (opportunities.length === 0) return '📭 لا توجد فرص حالياً';
     
-    let message = `🔥 *أفضل الفرص (${opportunities.length})*\n━━━━━━━━━━━━━━━━━━\n`;
+    let message = `🔥 *أفضل الفرص المتاحة*\n`;
+    message += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+    message += `📊 إجمالي الفرص: ${opportunities.length}\n`;
+    message += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+    
     const top = opportunities.slice(0, limit);
     
     top.forEach((opp, i) => {
-        const categoryEmoji = opp.category.startsWith('A') ? '🔥' : opp.category.startsWith('B') ? '⭐' : opp.category.startsWith('C') ? '📌' : '👀';
+        const isCrypto = opp.symbol.includes('-USD');
+        const marketEmoji = isCrypto ? '🪙' : '📈';
+        const marketName = isCrypto ? 'عملة مشفرة' : 'سهم أمريكي';
+        
+        let categoryEmoji, categoryName, color;
+        if (opp.category.startsWith('A')) {
+            categoryEmoji = '🔥';
+            categoryName = 'فرصة ممتازة';
+            color = '🟢';
+        } else if (opp.category.startsWith('B')) {
+            categoryEmoji = '⭐';
+            categoryName = 'فرصة جيدة';
+            color = '🟡';
+        } else if (opp.category.startsWith('C')) {
+            categoryEmoji = '📌';
+            categoryName = 'يستحق المتابعة';
+            color = '🟠';
+        } else {
+            categoryEmoji = '👀';
+            categoryName = 'مراقبة عامة';
+            color = '🔵';
+        }
+        
+        let confidenceEmoji = opp.confidence >= 8 ? '🟢' : opp.confidence >= 5 ? '🟡' : '🔴';
+        
         message +=
-            `${i+1}. *${opp.symbol}* ${categoryEmoji} [${opp.category}]\n` +
-            `   📊 التقييم: ${opp.score}/100 | الثقة: ${opp.confidence}/10\n` +
-            `   💰 السعر: $${opp.price} | التغير: ${opp.change}%\n` +
-            `   💧 الحجم: ${opp.volumeRatio}x\n` +
-            `   🎯 الدخول: $${opp.entry} | الهدف: $${opp.takeProfit} | وقف: $${opp.stopLoss}\n` +
-            `   ⚖️ المخاطرة/العائد: 1:${opp.riskReward}\n` +
-            `   📋 ${opp.details.join(' | ')}\n` +
-            `━━━━━━━━━━━━━━━━━━\n`;
+            `*${i+1}. ${marketEmoji} ${opp.symbol}* ${categoryEmoji} (${categoryName})\n` +
+            `   ${color} التقييم: ${opp.score}/100 | ${confidenceEmoji} الثقة: ${opp.confidence}/10\n` +
+            `   📍 السوق: ${marketName}\n` +
+            `   💰 السعر: $${opp.price} | 📈 التغير: ${opp.change}%\n` +
+            `   🎯 *نقطة الدخول:* $${opp.entry}\n` +
+            `   🚀 *الهدف:* $${opp.takeProfit}\n` +
+            `   🛑 *وقف الخسارة:* $${opp.stopLoss}\n` +
+            `   ⚖️ المخاطرة/العائد: 1:${opp.riskReward}\n`;
+        
+        let recommendation = '';
+        if (opp.score >= 80) recommendation = '✅ توصية: شراء قوي';
+        else if (opp.score >= 60) recommendation = '👀 توصية: مراقبة';
+        else if (opp.score >= 40) recommendation = '📌 توصية: إضافة لقائمة المراقبة';
+        else recommendation = '⏳ توصية: انتظر فرصة أفضل';
+        message += `   💡 ${recommendation}\n`;
+        message += `   ────────────────────────\n\n`;
     });
+    
+    message += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+    message += `💡 *نصيحة:* استخدم /تحليل [الرمز] للحصول على تفاصيل كاملة.`;
     return message;
 }
 
-// ===== أوامر البوت =====
+// ===== الإرسال التلقائي للفرص =====
+async function sendAutoOpportunities() {
+    if (!autoSendEnabled) {
+        console.log('⏸️ الإرسال التلقائي موقف');
+        return;
+    }
+    
+    console.log('🔍 جاري البحث عن الفرص للإرسال التلقائي...');
+    const opportunities = await scanMarket();
+    
+    if (opportunities.length === 0) {
+        console.log('📭 لا توجد فرص حالياً');
+        return;
+    }
+    
+    const goodOpportunities = opportunities.filter(opp => 
+        opp.category.startsWith('A') || opp.category.startsWith('B')
+    );
+    
+    if (goodOpportunities.length === 0) {
+        console.log('📭 لا توجد فرص جيدة حالياً');
+        return;
+    }
+    
+    const currentSymbols = goodOpportunities.map(o => o.symbol).join(',');
+    const lastSymbols = lastSentOpportunities.map(o => o.symbol).join(',');
+    
+    if (currentSymbols === lastSymbols && !isFirstRun) {
+        console.log('⏳ لا توجد فرص جديدة');
+        return;
+    }
+    
+    isFirstRun = false;
+    lastSentOpportunities = goodOpportunities;
+    
+    const message = `🔔 *تنبيه تلقائي: فرص جديدة!*\n` +
+                    `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+                    `📊 تم العثور على ${goodOpportunities.length} فرصة جديدة.\n` +
+                    `🕒 ${new Date().toLocaleTimeString()}\n` +
+                    `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+                    `💡 استخدم /فرص لعرض التفاصيل الكاملة.\n` +
+                    `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+                    `⏸️ لإيقاف التنبيهات: /ايقاف_تنبيه`;
+    
+    bot.sendMessage(userId, message, { parse_mode: 'Markdown' });
+}
+
+// ===== أوامر تشغيل/إيقاف الإرسال التلقائي =====
+bot.onText(/\/تفعيل_تنبيه/, (msg) => {
+    if (msg.chat.id.toString() !== userId) return;
+    autoSendEnabled = true;
+    bot.sendMessage(msg.chat.id, '✅ *تم تفعيل التنبيهات التلقائية*', { parse_mode: 'Markdown' });
+});
+
+bot.onText(/\/ايقاف_تنبيه/, (msg) => {
+    if (msg.chat.id.toString() !== userId) return;
+    autoSendEnabled = false;
+    bot.sendMessage(msg.chat.id, '⛔ *تم إيقاف التنبيهات التلقائية*', { parse_mode: 'Markdown' });
+});
+
+// ===== الأوامر الأساسية =====
 bot.onText(/\/start|\/بدء/, (msg) => {
     const statusStocks = marketSettings.stocks ? '🟢 مفعل' : '🔴 متوقف';
     const statusCrypto = marketSettings.crypto ? '🟢 مفعل' : '🔴 متوقف';
+    const autoStatus = autoSendEnabled ? '🟢 مفعل' : '🔴 متوقف';
     
     bot.sendMessage(msg.chat.id,
-        `🏠 *القائمة الرئيسية*\n━━━━━━━━━━━━━━━━━━\n` +
+        `🏠 *القائمة الرئيسية*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
         `📈 *السوق الأمريكي:* ${statusStocks}\n` +
         `🪙 *العملات المشفرة:* ${statusCrypto}\n` +
-        `━━━━━━━━━━━━━━━━━━\n` +
+        `🔔 *التنبيهات التلقائية:* ${autoStatus}\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
         `📋 *الأوامر:*\n` +
-        `/فرص - عرض أفضل الفرص (نظام التقييم)\n` +
+        `/فرص - عرض أفضل الفرص\n` +
         `/تحليل [الرمز] - تحليل مفصل\n` +
         `/اعدادات - إعدادات الأسواق\n` +
         `/اختبار - اختبار البوت\n` +
         `/احصائيات - إحصائيات الإشارات\n` +
-        `━━━━━━━━━━━━━━━━━━\n` +
-        `💡 نظام التقييم: 100 نقطة (أخبار، حجم، حركة، محفزات)`,
+        `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `⚙️ *التنبيهات:*\n` +
+        `/تفعيل_تنبيه - تشغيل التنبيهات التلقائية\n` +
+        `/ايقاف_تنبيه - إيقاف التنبيهات التلقائية\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `💡 البوت يرسل تنبيهات كل 5 دقائق عند وجود فرص جديدة.`,
         { parse_mode: 'Markdown' }
     );
 });
@@ -421,7 +516,7 @@ bot.onText(/\/test|\/اختبار/, (msg) => {
     bot.sendMessage(msg.chat.id, '✅ البوت يعمل بشكل ممتاز!');
 });
 
-// ===== تحديث دوري كل 5 دقائق =====
+// ===== تحديث دوري =====
 async function periodicUpdate() {
     console.log('🔄 تحديث دوري للفرص...');
     await scanMarket();
@@ -429,15 +524,16 @@ async function periodicUpdate() {
 }
 
 setInterval(periodicUpdate, 5 * 60 * 1000);
+setInterval(sendAutoOpportunities, 5 * 60 * 1000);
+setTimeout(sendAutoOpportunities, 30000);
 
-// ===== تحميل القوائم عند بدء التشغيل =====
 async function init() {
     console.log('🔄 جاري تحميل قوائم الأسواق...');
     stockList = await fetchStockList();
     cryptoList = await fetchCryptoList();
     console.log(`✅ تم تحميل ${stockList.length} سهماً و ${cryptoList.length} عملة`);
     await periodicUpdate();
-    console.log('✅ البوت يعمل بنظام التقييم!');
+    console.log('✅ البوت يعمل بنظام الإرسال التلقائي!');
 }
 
 init();
