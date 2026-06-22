@@ -4,17 +4,10 @@ const axios = require('axios');
 const token = '8871928848:AAGuRrN_0IFxcq0sU0JitXhCKPK_1QGNXn0';
 const bot = new TelegramBot(token, { polling: true });
 
-// ===== إعدادات الأسواق =====
-let marketSettings = {
-    stocks: true,
-    crypto: true
-};
-
-// ===== قوائم الأسهم والعملات (ديناميكية) =====
+let marketSettings = { stocks: true, crypto: true };
 let stockList = [];
 let cryptoList = [];
 
-// ===== قائمة الأسهم المحرمة (نسبة تطهير 100%) =====
 const forbiddenStocks = [
     'BAC', 'JPM', 'C', 'WFC', 'GS', 'MS', 'V', 'MA', 'AXP',
     'KO', 'PEP', 'STZ', 'BF.B', 'TAP',
@@ -22,12 +15,9 @@ const forbiddenStocks = [
     'PM', 'MO', 'BTI'
 ];
 
-// ===== دالة جلب قائمة الأسهم من S&P 500 =====
 async function fetchStockList() {
     try {
-        const response = await axios.get(
-            'https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv'
-        );
+        const response = await axios.get('https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv');
         const lines = response.data.split('\n');
         const symbols = [];
         for (let i = 1; i < lines.length; i++) {
@@ -36,40 +26,28 @@ async function fetchStockList() {
                 const parts = line.split(',');
                 if (parts[0]) {
                     const symbol = parts[0].trim().replace(/"/g, '');
-                    if (!forbiddenStocks.includes(symbol)) {
-                        symbols.push(symbol);
-                    }
+                    if (!forbiddenStocks.includes(symbol)) symbols.push(symbol);
                 }
             }
         }
         return symbols;
     } catch (error) {
-        console.log('❌ خطأ في جلب قائمة الأسهم:', error.message);
         return ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'META', 'NVDA', 'AMD', 'INTC', 'NFLX'];
     }
 }
 
-// ===== دالة جلب قائمة العملات المشفرة =====
 async function fetchCryptoList() {
     try {
-        const response = await axios.get(
-            'https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=100&page=1&sparkline=false'
-        );
-        const symbols = response.data.map(c => c.symbol.toUpperCase() + '-USD');
-        return symbols;
+        const response = await axios.get('https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=100&page=1&sparkline=false');
+        return response.data.map(c => c.symbol.toUpperCase() + '-USD');
     } catch (error) {
-        console.log('❌ خطأ في جلب العملات:', error.message);
         return ['BTC-USD', 'ETH-USD', 'SOL-USD', 'XRP-USD', 'ADA-USD', 'DOT-USD', 'AVAX-USD', 'MATIC-USD', 'LINK-USD', 'UNI-USD'];
     }
 }
 
-// ===== دالة جلب البيانات =====
 async function getPrice(symbol) {
     try {
-        const response = await axios.get(
-            `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}`,
-            { timeout: 5000 }
-        );
+        const response = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}`, { timeout: 5000 });
         const data = response.data.chart.result[0];
         if (!data) return null;
         const quote = data.indicators.quote[0];
@@ -80,12 +58,9 @@ async function getPrice(symbol) {
         const lowPrice = Math.min(...quote.low);
         const volume = quote.volume[quote.volume.length - 1] || 0;
         return { symbol, lastPrice, change, highPrice, lowPrice, volume };
-    } catch (error) {
-        return null;
-    }
+    } catch (error) { return null; }
 }
 
-// ===== دالة حساب التطهير =====
 function getPurification(symbol) {
     if (forbiddenStocks.includes(symbol)) {
         return { percentage: 100, isForbidden: true, reason: 'نشاط محرم (ربا/خمور/قمار)' };
@@ -96,25 +71,19 @@ function getPurification(symbol) {
         'INTC': 0.8, 'NFLX': 0.5, 'ADBE': 1.0, 'CRM': 1.5,
         'ORCL': 1.2, 'IBM': 1.0
     };
-    const pct = rates[symbol] || 0.5;
-    return { percentage: pct, isForbidden: false, reason: 'نشاط مختلط' };
+    return { percentage: rates[symbol] || 0.5, isForbidden: false, reason: 'نشاط مختلط' };
 }
 
-// ===== مسح السوق بالكامل =====
 async function scanMarket() {
     const results = [];
     const allSymbols = [];
     
     if (marketSettings.stocks) {
-        if (stockList.length === 0) {
-            stockList = await fetchStockList();
-        }
+        if (stockList.length === 0) stockList = await fetchStockList();
         allSymbols.push(...stockList.slice(0, 50));
     }
     if (marketSettings.crypto) {
-        if (cryptoList.length === 0) {
-            cryptoList = await fetchCryptoList();
-        }
+        if (cryptoList.length === 0) cryptoList = await fetchCryptoList();
         allSymbols.push(...cryptoList.slice(0, 20));
     }
     
@@ -135,8 +104,8 @@ async function scanMarket() {
             if (p.isForbidden || p.percentage > 3) continue;
             
             const change = data.change;
-            const isUptrend = change > 1.5;
-            const isVolatile = ((data.highPrice - data.lowPrice) / data.lowPrice * 100) > 2;
+            const isUptrend = change > 0.5;
+            const isVolatile = ((data.highPrice - data.lowPrice) / data.lowPrice * 100) > 0.5;
             
             if (isUptrend && isVolatile) {
                 const entry = (data.lastPrice * 0.98).toFixed(2);
@@ -161,7 +130,6 @@ async function scanMarket() {
     return results.slice(0, 5);
 }
 
-// ===== الأوامر =====
 bot.onText(/\/start|\/بدء/, (msg) => {
     const statusStocks = marketSettings.stocks ? '🟢 مفعل' : '🔴 متوقف';
     const statusCrypto = marketSettings.crypto ? '🟢 مفعل' : '🔴 متوقف';
@@ -262,7 +230,7 @@ bot.onText(/\/تحليل (.+)/, async (msg, match) => {
 });
 
 bot.onText(/\/فرص/, async (msg) => {
-    await bot.sendMessage(msg.chat.id, '🔍 جاري البحث عن الفرص في جميع الأسواق...');
+    await bot.sendMessage(msg.chat.id, '🔍 جاري البحث عن الفرص...');
     
     const opportunities = await scanMarket();
     
@@ -300,7 +268,6 @@ bot.onText(/\/test|\/اختبار/, (msg) => {
     bot.sendMessage(msg.chat.id, '✅ البوت يعمل بشكل ممتاز!');
 });
 
-// ===== تحميل القوائم عند بدء التشغيل =====
 async function init() {
     console.log('🔄 جاري تحميل قوائم الأسواق...');
     stockList = await fetchStockList();
@@ -308,8 +275,7 @@ async function init() {
     console.log(`✅ تم تحميل ${stockList.length} سهماً و ${cryptoList.length} عملة`);
     console.log(`📈 السوق الأمريكي: ${marketSettings.stocks ? 'مفعل' : 'موقف'}`);
     console.log(`🪙 العملات المشفرة: ${marketSettings.crypto ? 'مفعل' : 'موقف'}`);
+    console.log('✅ البوت يعمل...');
 }
 
 init();
-
-console.log('✅ البوت يعمل...');
