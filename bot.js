@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 
 // ===== التوكنات =====
-const token = process.env.BOT_TOKEN || '8871928848:AAGuRrN_0IFxcq0sU0JitXhCKPK_1QGNXn0';
+const token = '8871928848:AAHomIkqXhDdOhbU7-acSKpUVwmpRfvzzkA';
 const userId = '709023711';
 const bot = new TelegramBot(token, { polling: true });
 
@@ -335,14 +335,13 @@ async function scanMarket() {
     return results;
 }
 
-// ===== FORMAT SINGLE OPPORTUNITY (WITHOUT MARKDOWN ERRORS) =====
+// ===== FORMAT SINGLE OPPORTUNITY =====
 function formatSingleOpportunity(opp, index) {
     const categoryEmoji = opp.category.includes('EXPLOSIVE') ? '💥' :
                           opp.category.includes('HIGH') ? '🔥' :
                           opp.category.includes('OPPORTUNITY') ? '✅' :
                           opp.category.includes('WATCHLIST') ? '📌' : '⏳';
 
-    // تجنب مشاكل Markdown بإزالة الرموز الخاصة
     const safeSymbol = opp.symbol.replace(/[^a-zA-Z0-9-]/g, '');
     const safeMarket = opp.market.replace(/[^a-zA-Z0-9 ]/g, '');
 
@@ -363,7 +362,7 @@ function formatSingleOpportunity(opp, index) {
     return message;
 }
 
-// ===== SEND OPPORTUNITIES (ONE BY ONE) =====
+// ===== SEND OPPORTUNITIES =====
 async function sendOpportunities(chatId, opportunities, limit = 10) {
     if (opportunities.length === 0) {
         bot.sendMessage(chatId, '📭 لا توجد فرص حالياً');
@@ -391,7 +390,6 @@ async function sendOpportunities(chatId, opportunities, limit = 10) {
                 ...inlineKeyboard
             });
         } catch (error) {
-            // إذا فشل Markdown، نرسل بدون تنسيق
             await bot.sendMessage(chatId, message.replace(/\*/g, ''), inlineKeyboard);
         }
     }
@@ -658,7 +656,7 @@ setTimeout(sendAutoOpportunities, 30000);
 
 // ===== START =====
 async function init() {
-    console.log('🚀 OPPORTUNITY HUNTER AI V3 (Fixed)');
+    console.log('🚀 OPPORTUNITY HUNTER AI V3 (Final)');
     console.log('🔄 جاري تحميل قوائم الأسواق...');
     stockList = await fetchStockList();
     cryptoList = await fetchCryptoList();
@@ -668,7 +666,7 @@ async function init() {
     console.log('✅ البوت يعمل!');
     
     try {
-        await bot.sendMessage(userId, '🔔 *تم تفعيل البوت التفاعلي!*\nكل فرصة تأتي مع زر تحليل مباشر.', { parse_mode: 'Markdown' });
+        await bot.sendMessage(userId, '🔔 *تم تفعيل البوت النهائي!*\nكل فرصة تأتي مع زر تحليل مباشر.', { parse_mode: 'Markdown' });
     } catch (error) {
         console.error('❌ فشل إرسال رسالة التأكيد:', error.message);
     }
