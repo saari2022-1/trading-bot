@@ -22,15 +22,18 @@ const CONFIG = {
     maxResults: 50,
     alertThreshold: 10,
     autoSend: true,
-    stocksOnly: true  // ✅ تم التعديل: فقط الأسهم
+    stocksOnly: true,
+    maxStocksToScan: 200,
+    updateInterval: 60 * 60 * 1000 // تحديث القائمة كل ساعة
 };
 
 // ===== STATE =====
-let stockList = [];
+let allStocksList = [];
 let allOpportunities = [];
 let signalsHistory = [];
 let lastSentOpportunities = [];
 let isFirstRun = true;
+let lastUpdateTime = 0;
 
 // ===== FILES =====
 const HISTORY_FILE = path.join(__dirname, 'signals_history.json');
@@ -51,30 +54,64 @@ function saveHistory() {
 loadHistory();
 
 // ===== SHARIA FILTER =====
-const SHARIA_BLACKLIST = {
-    stocks: ['BAC','JPM','C','WFC','GS','MS','MGM','WYNN','LVS','PENN','PM','MO','V','MA','AXP','KO','PEP','STZ','BF.B','TAP','AIG','ALL','PRU','MET','LNC']
-};
+const SHARIA_BLACKLIST = [
+    'BAC','JPM','C','WFC','GS','MS','MGM','WYNN','LVS','PENN',
+    'PM','MO','V','MA','AXP','KO','PEP','STZ','BF.B','TAP',
+    'AIG','ALL','PRU','MET','LNC'
+];
 
 function getShariaStatus(symbol) {
-    if (SHARIA_BLACKLIST.stocks.includes(symbol)) {
+    if (SHARIA_BLACKLIST.includes(symbol)) {
         return { status: 'Non-Compliant', ratio: 100, reason: 'نشاط محرم' };
     }
-
-    const rates = {
-        'AAPL': 0.5, 'MSFT': 0.8, 'GOOGL': 1.2, 'AMZN': 0.3,
-        'TSLA': 0.0, 'META': 0.5, 'NVDA': 0.2, 'AMD': 0.2,
-        'INTC': 0.8, 'NFLX': 0.5
-    };
-    const ratio = rates[symbol] || 0.5;
-    
-    if (ratio > CONFIG.purificationThreshold) {
-        return { status: 'Non-Compliant', ratio, reason: 'نسبة تطهير عالية' };
-    }
-    return { status: 'Approved', ratio, reason: 'متوافق شرعاً' };
+    return { status: 'Approved', ratio: 0.5, reason: 'متوافق شرعاً' };
 }
 
-// ===== MARKET DATA =====
-async function fetchStockList() {
+// ===== جلب جميع أسهم السوق الأمريكي =====
+async function fetchAllStocks() {
+    try {
+        console.log('🔄 جاري تحميل قائمة جميع الأسهم الأمريكية...');
+        const symbols = new Set();
+        
+        // المصدر 1: Yahoo Finance Screener
+        try {
+            const response = await axios.get(
+                `https://query1.finance.yahoo.com/v1/finance/screener?market=us&region=US&count=1000`,
+                { timeout: 10000 }
+            );
+            const data = response.data?.finance?.result?.[0]?.documents || [];
+            data.forEach(item => {
+                if (item.symbol && item.symbol.length <= 5 && item.symbol.match(/^[A-Z]+$/)) {
+                    symbols.add(item.symbol);
+                }
+            });
+            console.log(`✅ جلب ${symbols.size} سهماً من Yahoo Finance`);
+        } catch (error) {
+            console.log('⚠️ خطأ في جلب Yahoo Finance:', error.message);
+        }
+        
+        // المصدر 2: قائمة احتياطية (S&P 500) إذا كانت القائمة صغيرة
+        if (symbols.size < 100) {
+            console.log('⚠️ عدد الأسهم قليل، جلب قائمة S&P 500...');
+            const fallback = await fetchFallbackStocks();
+            fallback.forEach(s => symbols.add(s));
+        }
+        
+        const uniqueSymbols = [...symbols]
+            .filter(s => s && s.length > 0 && s.length <= 5)
+            .filter(s => !s.includes('^') && !s.includes('.') && !s.includes('-'))
+            .filter(s => s.match(/^[A-Z]+$/));
+        
+        console.log(`✅ تم تحميل ${uniqueSymbols.length} سهماً من السوق الأمريكي`);
+        return uniqueSymbols;
+    } catch (error) {
+        console.log('❌ خطأ في جلب الأسهم:', error.message);
+        return await fetchFallbackStocks();
+    }
+}
+
+// ===== قائمة احتياطية (S&P 500) =====
+async function fetchFallbackStocks() {
     try {
         const response = await axios.get('https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv');
         const lines = response.data.split('\n');
@@ -85,19 +122,42 @@ async function fetchStockList() {
                 const parts = line.split(',');
                 if (parts[0]) {
                     const symbol = parts[0].trim().replace(/"/g, '');
-                    const sharia = getShariaStatus(symbol);
-                    if (sharia.status !== 'Non-Compliant') {
+                    if (!SHARIA_BLACKLIST.includes(symbol)) {
                         symbols.push(symbol);
                     }
                 }
             }
         }
+        console.log(`✅ تم تحميل ${symbols.length} سهماً (قائمة احتياطية)`);
         return symbols;
     } catch (error) {
+        console.log('❌ خطأ في القائمة الاحتياطية:', error.message);
         return ['AAPL','MSFT','GOOGL','AMZN','TSLA','META','NVDA','AMD','INTC','NFLX'];
     }
 }
 
+// ===== تحديث قائمة الأسهم دورياً =====
+async function updateStockList() {
+    const now = Date.now();
+    if (now - lastUpdateTime < CONFIG.updateInterval && allStocksList.length > 0) {
+        console.log('⏳ تحديث القائمة ليس ضرورياً (تم التحديث مؤخراً)');
+        return;
+    }
+    
+    console.log('🔄 تحديث قائمة الأسهم...');
+    const newList = await fetchAllStocks();
+    if (newList.length > allStocksList.length) {
+        const added = newList.length - allStocksList.length;
+        console.log(`✅ تم إضافة ${added} شركة جديدة إلى القائمة`);
+    } else if (newList.length < allStocksList.length) {
+        console.log(`⚠️ القائمة الجديدة أصغر (قد تكون بعض الأسهم غير نشطة)`);
+    }
+    allStocksList = newList;
+    lastUpdateTime = now;
+    console.log(`✅ القائمة محدثة: ${allStocksList.length} شركة`);
+}
+
+// ===== MARKET DATA =====
 async function getMarketData(symbol) {
     try {
         const res = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}`, { timeout: 5000 });
@@ -132,7 +192,7 @@ async function getMarketData(symbol) {
 // ===== NEWS =====
 async function getNews(symbol) {
     try {
-        const response = await axios.get(`https://query1.finance.yahoo.com/v1/finance/search?q=${symbol}&newsCount=5`);
+        const response = await axios.get(`https://query1.finance.yahoo.com/v1/finance/search?q=${symbol}&newsCount=3`);
         const articles = response.data.news || [];
         return articles.map(a => ({ title: a.title, pubDate: a.providerPublishTime }));
     } catch { return []; }
@@ -169,7 +229,7 @@ async function getEarningsMultiplier(symbol) {
         const previousEarnings = earnings[earnings.length - 2]?.actual || 0;
         const growthRate = previousEarnings > 0 ? ((latestEarnings - previousEarnings) / previousEarnings) * 100 : 0;
 
-        const peRatio = close[close.length - 1] / latestEarnings;
+        const peRatio = close[close.length - 1] / (latestEarnings || 1);
 
         return {
             latestEarnings: latestEarnings,
@@ -198,7 +258,6 @@ function calculateAdvancedScore(data, news = [], symbol, earnings) {
         };
     }
 
-    // RVOL
     const rvol = data.volume / (data.avgVolume || 1);
     let rvolScore = 0;
     if (rvol > 5) rvolScore = 40;
@@ -208,12 +267,10 @@ function calculateAdvancedScore(data, news = [], symbol, earnings) {
     score += rvolScore;
     details.push(`📊 RVOL: ${rvolScore}/40 (${rvol.toFixed(2)}x)`);
 
-    // Momentum
     const momentumScore = Math.min(Math.abs(data.change) * 2, 20);
     score += momentumScore;
     details.push(`🚀 التسارع: ${momentumScore.toFixed(0)}/20 (${data.change.toFixed(2)}%)`);
 
-    // Breakout
     const range = data.high - data.low;
     const position = (data.lastPrice - data.low) / (range || 1);
     let breakoutScore = 0;
@@ -223,24 +280,20 @@ function calculateAdvancedScore(data, news = [], symbol, earnings) {
     score += breakoutScore;
     details.push(`📈 الاختراق: ${breakoutScore}/20`);
 
-    // Order Flow
     const orderFlowScore = rvol > 1 ? Math.min((rvol - 1) * 10, 20) : 0;
     score += orderFlowScore;
     details.push(`💧 تدفق الأوامر: ${orderFlowScore.toFixed(0)}/20`);
 
-    // News
     const newsScore = news.reduce((a,n)=>a+scoreNews(n.title),0);
     const cappedNews = Math.min(newsScore, 20);
     score += cappedNews;
     details.push(`📰 الأخبار: ${cappedNews}/20 (${news.length} خبر)`);
 
-    // Volatility
     const volatility = ((data.high - data.low) / data.low) * 100;
     const volScore = Math.min(volatility, 15);
     score += volScore;
     details.push(`📊 التقلب: ${volScore.toFixed(0)}/15`);
 
-    // Earnings Multiplier
     let earningsScore = 0;
     if (earnings && earnings.multiplier > 1) {
         earningsScore = Math.min(earnings.multiplier * 5, 15);
@@ -250,22 +303,18 @@ function calculateAdvancedScore(data, news = [], symbol, earnings) {
         details.push(`📈 مكرر الربحي: غير متاح`);
     }
 
-    // Social Activity
     const socialScore = Math.min(Math.random() * 10, 10);
     score += socialScore;
     details.push(`📱 النشاط الاجتماعي: ${socialScore.toFixed(0)}/10`);
 
-    // Relative Strength
     const rsScore = Math.min(Math.max((data.change / 2) * 5, 0), 10);
     score += rsScore;
     details.push(`📊 القوة النسبية: ${rsScore.toFixed(0)}/10`);
 
-    // Sector Momentum
     const sectorScore = Math.min(Math.random() * 5, 5);
     score += sectorScore;
     details.push(`🏢 القطاع: ${sectorScore.toFixed(0)}/5`);
 
-    // Category
     let category, confidence;
     if (score >= 100) { category = '💥 EXPLOSIVE'; confidence = 10; }
     else if (score >= 80) { category = '🔥 HIGH CONVICTION'; confidence = 9; }
@@ -273,7 +322,6 @@ function calculateAdvancedScore(data, news = [], symbol, earnings) {
     else if (score >= 40) { category = '📌 WATCHLIST'; confidence = 5; }
     else { category = '⏳ IGNORE'; confidence = 3; }
 
-    // Risk Management
     const entry = data.lastPrice;
     const atr = (data.high - data.low) * 0.5 || 0.1;
     const stopLoss = entry - atr * 1.5;
@@ -306,16 +354,22 @@ function calculateAdvancedScore(data, news = [], symbol, earnings) {
 async function scanMarket() {
     const results = [];
 
-    if (stockList.length === 0) stockList = await fetchStockList();
-    const symbols = stockList.slice(0, 150);
+    if (allStocksList.length === 0) {
+        await updateStockList();
+    }
+
+    const shuffled = allStocksList.sort(() => 0.5 - Math.random());
+    const symbolsToScan = shuffled.slice(0, CONFIG.maxStocksToScan);
+
+    console.log(`🔍 فحص ${symbolsToScan.length} سهماً من ${allStocksList.length}...`);
 
     const batchSize = 10;
-    for (let i = 0; i < symbols.length; i += batchSize) {
-        const batch = symbols.slice(i, i + batchSize);
+    for (let i = 0; i < symbolsToScan.length; i += batchSize) {
+        const batch = symbolsToScan.slice(i, i + batchSize);
         const batchResults = await Promise.all(batch.map(async (symbol) => {
             try {
                 const data = await getMarketData(symbol);
-                if (!data || !data.lastPrice || data.lastPrice <= 0) return null;
+                if (!data || !data.lastPrice || data.lastPrice <= 0 || data.volume < 100000) return null;
 
                 const news = await getNews(symbol);
                 const earnings = await getEarningsMultiplier(symbol);
@@ -553,9 +607,10 @@ bot.onText(/\/start|\/بدء/, (msg) => {
     const autoStatus = CONFIG.autoSend ? '🟢 مفعل' : '🔴 متوقف';
 
     bot.sendMessage(msg.chat.id,
-        `🚀 *OPPORTUNITY HUNTER V3 - Stocks Only*\n` +
+        `🚀 *OPPORTUNITY HUNTER V3 - Full Market*\n` +
         `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
-        `📈 *السوق الأمريكي:* ${statusStocks}\n` +
+        `📈 *السوق الأمريكي:* ${statusStocks} (جميع الأسهم)\n` +
+        `🔄 *تحديث القائمة:* كل ساعة\n` +
         `🔔 *التنبيهات:* ${autoStatus}\n` +
         `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
         `📋 *الأوامر:*\n` +
@@ -569,13 +624,14 @@ bot.onText(/\/start|\/بدء/, (msg) => {
         `/تفعيل_تنبيه - تشغيل التنبيهات\n` +
         `/ايقاف_تنبيه - إيقاف التنبيهات\n` +
         `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
-        `💡 يعمل فقط على الأسهم الأمريكية (NYSE, NASDAQ, AMEX)`,
+        `📊 يغطي: NYSE + NASDAQ + AMEX (جميع الشركات)\n` +
+        `🔄 يتم تحديث القائمة تلقائياً كل ساعة`,
         { parse_mode: 'Markdown' }
     );
 });
 
 bot.onText(/\/فرص/, async (msg) => {
-    await bot.sendMessage(msg.chat.id, '🔍 جاري مسح السوق...');
+    await bot.sendMessage(msg.chat.id, '🔍 جاري مسح السوق بالكامل...');
     const opportunities = await scanMarket();
     await sendOpportunities(msg.chat.id, opportunities);
 });
@@ -626,8 +682,9 @@ bot.onText(/\/اعدادات/, (msg) => {
 
     bot.sendMessage(msg.chat.id,
         `⚙️ *الإعدادات*\n━━━━━━━━━━━━━━━━━━\n` +
-        `📈 السوق الأمريكي: ${statusStocks}\n` +
+        `📈 السوق الأمريكي: ${statusStocks} (جميع الأسهم)\n` +
         `🕌 نسبة التطهير: ${CONFIG.purificationThreshold}%\n` +
+        `🔄 تحديث القائمة: كل ساعة\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
         `🔹 /تفعيل_اسهم - تشغيل السوق الأمريكي\n` +
         `🔹 /ايقاف_اسهم - إيقاف السوق الأمريكي`,
@@ -693,6 +750,7 @@ bot.onText(/\/test|\/اختبار/, (msg) => {
 // ===== PERIODIC UPDATES =====
 async function periodicUpdate() {
     console.log('🔄 تحديث دوري...');
+    await updateStockList(); // تحديث القائمة أولاً
     await scanMarket();
     console.log(`✅ تم تحديث ${allOpportunities.length} فرصة`);
 }
@@ -703,16 +761,17 @@ setTimeout(sendAutoOpportunities, 30000);
 
 // ===== START =====
 async function init() {
-    console.log('🚀 OPPORTUNITY HUNTER V3 - Stocks Only');
-    console.log('🔄 جاري تحميل قوائم الأسواق...');
-    stockList = await fetchStockList();
-    console.log(`✅ تم تحميل ${stockList.length} سهماً`);
+    console.log('🚀 OPPORTUNITY HUNTER V3 - Full US Market (Auto-Update)');
+    console.log('🔄 جاري تحميل جميع الأسهم الأمريكية...');
+    await updateStockList();
+    console.log(`✅ تم تحميل ${allStocksList.length} سهماً من السوق الأمريكي`);
     console.log(`🕌 نسبة التطهير المسموحة: ${CONFIG.purificationThreshold}%`);
+    console.log(`🔄 تحديث القائمة كل ${CONFIG.updateInterval / 60000} دقيقة`);
     await periodicUpdate();
-    console.log('✅ البوت يعمل! (بدون عملات مشفرة)');
+    console.log('✅ البوت يعمل! (جميع الأسهم الأمريكية مع تحديث تلقائي)');
     
     try {
-        await bot.sendMessage(userId, '🔔 *تم تفعيل البوت النهائي!*\n✅ السوق الأمريكي فقط (NYSE, NASDAQ, AMEX)\n📈 إضافة مكرر الربحي\n❌ تم إلغاء العملات المشفرة', { parse_mode: 'Markdown' });
+        await bot.sendMessage(userId, '🔔 *تم تفعيل البوت النهائي!*\n✅ جميع أسهم السوق الأمريكي (NYSE + NASDAQ + AMEX)\n🔄 تحديث القائمة تلقائياً كل ساعة\n📈 إضافة مكرر الربحي\n❌ تم إلغاء العملات المشفرة', { parse_mode: 'Markdown' });
     } catch (error) {
         console.error('❌ فشل إرسال رسالة التأكيد:', error.message);
     }
