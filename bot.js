@@ -1,19 +1,19 @@
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
 const fs = require('fs');
-const path = require('express');
+const path = require('path');
 
-// ===== التوكنات =====
-const token = '8871928848:AAHomIkqXhDdOhbU7-acSKpUVwmpRfvzzkA';
-const userId = '709023711';
-const bot = new TelegramBot(token, { polling: true });
-
-// ===== حل مشكلة المنفذ في Render =====
+// ===== حل مشكلة المنفذ =====
 const express = require('express');
 const app = express();
 const port = process.env.PORT || 3000;
 app.get('/', (req, res) => res.send('🤖 Bot is running!'));
 app.listen(port, () => console.log(`✅ Web server running on port ${port}`));
+
+// ===== التوكنات =====
+const token = '8871928848:AAHomIkqXhDdOhbU7-acSKpUVwmpRfvzzkA';
+const userId = '709023711';
+const bot = new TelegramBot(token, { polling: true });
 
 // ===== إعدادات البوت =====
 const CONFIG = {
@@ -22,7 +22,7 @@ const CONFIG = {
     maxResults: 50,
     alertThreshold: 10,
     autoSend: true,
-    markets: { stocks: true, crypto: false } // تم إلغاء العملات المشفرة
+    stocksOnly: true  // ✅ تم التعديل: فقط الأسهم
 };
 
 // ===== STATE =====
@@ -155,7 +155,6 @@ function scoreNews(title = '') {
 // ===== EARNINGS MULTIPLIER =====
 async function getEarningsMultiplier(symbol) {
     try {
-        // جلب بيانات الأرباح من Yahoo Finance
         const response = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}`, { timeout: 5000 });
         const r = response.data?.chart?.result?.[0];
         if (!r) return null;
@@ -166,12 +165,10 @@ async function getEarningsMultiplier(symbol) {
         
         if (earnings.length < 4) return null;
 
-        // حساب متوسط الأرباح للربع الأخير
         const latestEarnings = earnings[earnings.length - 1]?.actual || 0;
         const previousEarnings = earnings[earnings.length - 2]?.actual || 0;
         const growthRate = previousEarnings > 0 ? ((latestEarnings - previousEarnings) / previousEarnings) * 100 : 0;
 
-        // حساب مكرر الربحية (P/E Ratio)
         const peRatio = close[close.length - 1] / latestEarnings;
 
         return {
@@ -243,7 +240,7 @@ function calculateAdvancedScore(data, news = [], symbol, earnings) {
     score += volScore;
     details.push(`📊 التقلب: ${volScore.toFixed(0)}/15`);
 
-    // Earnings Multiplier (جديد)
+    // Earnings Multiplier
     let earningsScore = 0;
     if (earnings && earnings.multiplier > 1) {
         earningsScore = Math.min(earnings.multiplier * 5, 15);
@@ -393,6 +390,7 @@ function formatSingleOpportunity(opp, index) {
 
     let message =
         `*${index}. 📈 ${safeSymbol}* ${categoryEmoji}\n` +
+        `📌 *رمز الشركة:* ${safeSymbol}\n` +
         `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
         `📊 الفئة: ${categoryText}\n` +
         `🏆 التقييم: ${opp.score}/100\n` +
@@ -551,11 +549,11 @@ async function sendAutoOpportunities() {
 
 // ===== BOT COMMANDS =====
 bot.onText(/\/start|\/بدء/, (msg) => {
-    const statusStocks = CONFIG.markets.stocks ? '🟢 مفعل' : '🔴 متوقف';
+    const statusStocks = CONFIG.stocksOnly ? '🟢 مفعل' : '🔴 متوقف';
     const autoStatus = CONFIG.autoSend ? '🟢 مفعل' : '🔴 متوقف';
 
     bot.sendMessage(msg.chat.id,
-        `🚀 *OPPORTUNITY HUNTER AI V3*\n` +
+        `🚀 *OPPORTUNITY HUNTER V3 - Stocks Only*\n` +
         `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
         `📈 *السوق الأمريكي:* ${statusStocks}\n` +
         `🔔 *التنبيهات:* ${autoStatus}\n` +
@@ -570,7 +568,8 @@ bot.onText(/\/start|\/بدء/, (msg) => {
         `⚙️ *التنبيهات:*\n` +
         `/تفعيل_تنبيه - تشغيل التنبيهات\n` +
         `/ايقاف_تنبيه - إيقاف التنبيهات\n` +
-        `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
+        `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `💡 يعمل فقط على الأسهم الأمريكية (NYSE, NASDAQ, AMEX)`,
         { parse_mode: 'Markdown' }
     );
 });
@@ -623,7 +622,7 @@ bot.onText(/\/تحليل (.+)/, async (msg, match) => {
 });
 
 bot.onText(/\/اعدادات/, (msg) => {
-    const statusStocks = CONFIG.markets.stocks ? '🟢 مفعل' : '🔴 متوقف';
+    const statusStocks = CONFIG.stocksOnly ? '🟢 مفعل' : '🔴 متوقف';
 
     bot.sendMessage(msg.chat.id,
         `⚙️ *الإعدادات*\n━━━━━━━━━━━━━━━━━━\n` +
@@ -637,12 +636,12 @@ bot.onText(/\/اعدادات/, (msg) => {
 });
 
 bot.onText(/\/تفعيل_اسهم/, (msg) => {
-    CONFIG.markets.stocks = true;
+    CONFIG.stocksOnly = true;
     bot.sendMessage(msg.chat.id, '✅ *تم تفعيل السوق الأمريكي*', { parse_mode: 'Markdown' });
 });
 
 bot.onText(/\/ايقاف_اسهم/, (msg) => {
-    CONFIG.markets.stocks = false;
+    CONFIG.stocksOnly = false;
     bot.sendMessage(msg.chat.id, '⛔ *تم إيقاف السوق الأمريكي*', { parse_mode: 'Markdown' });
 });
 
@@ -704,16 +703,16 @@ setTimeout(sendAutoOpportunities, 30000);
 
 // ===== START =====
 async function init() {
-    console.log('🚀 OPPORTUNITY HUNTER AI V3 (Stocks Only + Earnings)');
+    console.log('🚀 OPPORTUNITY HUNTER V3 - Stocks Only');
     console.log('🔄 جاري تحميل قوائم الأسواق...');
     stockList = await fetchStockList();
     console.log(`✅ تم تحميل ${stockList.length} سهماً`);
     console.log(`🕌 نسبة التطهير المسموحة: ${CONFIG.purificationThreshold}%`);
     await periodicUpdate();
-    console.log('✅ البوت يعمل!');
+    console.log('✅ البوت يعمل! (بدون عملات مشفرة)');
     
     try {
-        await bot.sendMessage(userId, '🔔 *تم تفعيل البوت النهائي!*\n✅ السوق الأمريكي فقط\n📈 إضافة مكرر الربحي', { parse_mode: 'Markdown' });
+        await bot.sendMessage(userId, '🔔 *تم تفعيل البوت النهائي!*\n✅ السوق الأمريكي فقط (NYSE, NASDAQ, AMEX)\n📈 إضافة مكرر الربحي\n❌ تم إلغاء العملات المشفرة', { parse_mode: 'Markdown' });
     } catch (error) {
         console.error('❌ فشل إرسال رسالة التأكيد:', error.message);
     }
