@@ -18,13 +18,13 @@ const bot = new TelegramBot(token, { polling: true });
 // ===== إعدادات البوت =====
 const CONFIG = {
     purificationThreshold: 5,
-    scanInterval: 5 * 60 * 1000,
+    scanInterval: 2 * 60 * 1000, // دقيقتين
     maxResults: 50,
     alertThreshold: 10,
     autoSend: true,
     stocksOnly: true,
     maxStocksToScan: 200,
-    updateInterval: 60 * 60 * 1000
+    updateInterval: 60 * 60 * 1000 // كل ساعة
 };
 
 // ===== STATE =====
@@ -270,6 +270,75 @@ async function getMarketCap(symbol) {
     }
 }
 
+// ===== نظام تأكيد الفرصة =====
+let opportunityTracker = {};
+
+async function confirmOpportunity(symbol, currentScore, threshold = 40) {
+    if (!opportunityTracker[symbol]) {
+        opportunityTracker[symbol] = {
+            firstSeen: Date.now(),
+            scores: [],
+            confirmed: false,
+            confirmedAt: null
+        };
+    }
+    
+    const tracker = opportunityTracker[symbol];
+    tracker.scores.push(currentScore);
+    
+    if (tracker.scores.length > 3) {
+        tracker.scores.shift();
+    }
+    
+    if (tracker.scores.length >= 3) {
+        const allAboveThreshold = tracker.scores.every(s => s >= threshold);
+        if (allAboveThreshold && !tracker.confirmed) {
+            tracker.confirmed = true;
+            tracker.confirmedAt = Date.now();
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+// ===== كشف الانفجار السعري =====
+function detectPriceExplosion(data, rvol) {
+    const isHighVolume = rvol > 3;
+    const isStrongMove = Math.abs(data.change) > 2;
+    const isBreakout = ((data.lastPrice - data.low) / (data.high - data.low || 1)) > 0.95;
+    
+    if (isHighVolume && isStrongMove && isBreakout) {
+        return {
+            isExplosion: true,
+            level: '💥 انفجاري',
+            score: 30,
+            details: `RVOL ${rvol.toFixed(2)}x + حركة ${data.change.toFixed(2)}% + اختراق`
+        };
+    } else if (isHighVolume && isStrongMove) {
+        return {
+            isExplosion: true,
+            level: '🔥 قوي',
+            score: 20,
+            details: `RVOL ${rvol.toFixed(2)}x + حركة ${data.change.toFixed(2)}%`
+        };
+    } else if (isHighVolume) {
+        return {
+            isExplosion: true,
+            level: '📊 متوسط',
+            score: 10,
+            details: `RVOL ${rvol.toFixed(2)}x`
+        };
+    }
+    
+    return {
+        isExplosion: false,
+        level: null,
+        score: 0,
+        details: null
+    };
+}
+
 // ===== SCORE ENGINE =====
 function calculateAdvancedScore(data, news = [], symbol, earnings, marketCap) {
     let score = 0;
@@ -286,6 +355,55 @@ function calculateAdvancedScore(data, news = [], symbol, earnings, marketCap) {
         };
     }
 
+    // ===== RVOL =====
+    const rvol = data.volume / (data.avgVolume || 1);
+    let rvolScore = 0;
+    if (rvol > 5) rvolScore = 40;
+    else if (rvol > 3) rvolScore = 30;
+    else if (rvol > 2) rvolScore = 20;
+    else if (rvol > 1.2) rvolScore = 10;
+    score += rvolScore;
+    details.push(`📊 RVOL: ${rvolScore}/40 (${rvol.toFixed(2)}x)`);
+
+    // ===== الانفجار السعري =====
+    const explosion = detectPriceExplosion(data, rvol);
+    if (explosion.isExplosion) {
+        score += explosion.score;
+        details.push(`🔥 انفجارة سعرية: ${explosion.level} (${explosion.details})`);
+    }
+
+    // ===== Momentum =====
+    const momentumScore = Math.min(Math.abs(data.change) * 2, 20);
+    score += momentumScore;
+    details.push(`🚀 التسارع: ${momentumScore.toFixed(0)}/20 (${data.change.toFixed(2)}%)`);
+
+    // ===== Breakout =====
+    const range = data.high - data.low;
+    const position = (data.lastPrice - data.low) / (range || 1);
+    let breakoutScore = 0;
+    if (position > 0.95) breakoutScore = 20;
+    else if (position > 0.90) breakoutScore = 15;
+    else if (position > 0.85) breakoutScore = 10;
+    score += breakoutScore;
+    details.push(`📈 الاختراق: ${breakoutScore}/20`);
+
+    // ===== Order Flow =====
+    const orderFlowScore = rvol > 1 ? Math.min((rvol - 1) * 10, 20) : 0;
+    score += orderFlowScore;
+    details.push(`💧 تدفق الأوامر: ${orderFlowScore.toFixed(0)}/20`);
+
+    // ===== News =====
+    const newsScore = news.reduce((a,n)=>a+scoreNews(n.title),0);
+    const cappedNews = Math.min(newsScore, 20);
+    score += cappedNews;
+    details.push(`📰 الأخبار: ${cappedNews}/20 (${news.length} خبر)`);
+
+    // ===== Volatility =====
+    const volatility = ((data.high - data.low) / data.low) * 100;
+    const volScore = Math.min(volatility, 15);
+    score += volScore;
+    details.push(`📊 التقلب: ${volScore.toFixed(0)}/15`);
+
     // ===== القيمة السوقية =====
     let valueScore = 0;
     if (marketCap && marketCap.marketCapBillion) {
@@ -299,49 +417,7 @@ function calculateAdvancedScore(data, news = [], symbol, earnings, marketCap) {
         details.push(`💰 القيمة السوقية: غير متاح`);
     }
 
-    // RVOL
-    const rvol = data.volume / (data.avgVolume || 1);
-    let rvolScore = 0;
-    if (rvol > 5) rvolScore = 40;
-    else if (rvol > 3) rvolScore = 30;
-    else if (rvol > 2) rvolScore = 20;
-    else if (rvol > 1.2) rvolScore = 10;
-    score += rvolScore;
-    details.push(`📊 RVOL: ${rvolScore}/40 (${rvol.toFixed(2)}x)`);
-
-    // Momentum
-    const momentumScore = Math.min(Math.abs(data.change) * 2, 20);
-    score += momentumScore;
-    details.push(`🚀 التسارع: ${momentumScore.toFixed(0)}/20 (${data.change.toFixed(2)}%)`);
-
-    // Breakout
-    const range = data.high - data.low;
-    const position = (data.lastPrice - data.low) / (range || 1);
-    let breakoutScore = 0;
-    if (position > 0.95) breakoutScore = 20;
-    else if (position > 0.90) breakoutScore = 15;
-    else if (position > 0.85) breakoutScore = 10;
-    score += breakoutScore;
-    details.push(`📈 الاختراق: ${breakoutScore}/20`);
-
-    // Order Flow
-    const orderFlowScore = rvol > 1 ? Math.min((rvol - 1) * 10, 20) : 0;
-    score += orderFlowScore;
-    details.push(`💧 تدفق الأوامر: ${orderFlowScore.toFixed(0)}/20`);
-
-    // News
-    const newsScore = news.reduce((a,n)=>a+scoreNews(n.title),0);
-    const cappedNews = Math.min(newsScore, 20);
-    score += cappedNews;
-    details.push(`📰 الأخبار: ${cappedNews}/20 (${news.length} خبر)`);
-
-    // Volatility
-    const volatility = ((data.high - data.low) / data.low) * 100;
-    const volScore = Math.min(volatility, 15);
-    score += volScore;
-    details.push(`📊 التقلب: ${volScore.toFixed(0)}/15`);
-
-    // Earnings
+    // ===== Earnings =====
     let earningsScore = 0;
     if (earnings && earnings.multiplier > 1) {
         earningsScore = Math.min(earnings.multiplier * 5, 15);
@@ -351,22 +427,22 @@ function calculateAdvancedScore(data, news = [], symbol, earnings, marketCap) {
         details.push(`📈 مكرر الربحي: غير متاح`);
     }
 
-    // Social
+    // ===== Social =====
     const socialScore = Math.min(Math.random() * 10, 10);
     score += socialScore;
     details.push(`📱 النشاط الاجتماعي: ${socialScore.toFixed(0)}/10`);
 
-    // Relative Strength
+    // ===== Relative Strength =====
     const rsScore = Math.min(Math.max((data.change / 2) * 5, 0), 10);
     score += rsScore;
     details.push(`📊 القوة النسبية: ${rsScore.toFixed(0)}/10`);
 
-    // Sector
+    // ===== Sector =====
     const sectorScore = Math.min(Math.random() * 5, 5);
     score += sectorScore;
     details.push(`🏢 القطاع: ${sectorScore.toFixed(0)}/5`);
 
-    // Category
+    // ===== Category =====
     let category, confidence;
     if (score >= 100) { category = '💥 EXPLOSIVE'; confidence = 10; }
     else if (score >= 80) { category = '🔥 HIGH CONVICTION'; confidence = 9; }
@@ -374,7 +450,7 @@ function calculateAdvancedScore(data, news = [], symbol, earnings, marketCap) {
     else if (score >= 40) { category = '📌 WATCHLIST'; confidence = 5; }
     else { category = '⏳ IGNORE'; confidence = 3; }
 
-    // Risk Management
+    // ===== Risk Management =====
     const entry = data.lastPrice;
     const atr = (data.high - data.low) * 0.5 || 0.1;
     const stopLoss = entry - atr * 1.5;
@@ -400,7 +476,9 @@ function calculateAdvancedScore(data, news = [], symbol, earnings, marketCap) {
         market: '📈 Stocks',
         timestamp: Date.now(),
         earnings: earnings,
-        marketCap: marketCap
+        marketCap: marketCap,
+        explosion: explosion,
+        isExplosive: explosion.isExplosion
     };
 }
 
@@ -482,7 +560,7 @@ function formatSingleOpportunity(opp, index) {
     if (parseFloat(opp.change) < 0.5 && parseFloat(opp.change) > -0.5) {
         changeWarning = '⚠️ (حركة ضعيفة)';
     } else if (parseFloat(opp.change) > 3) {
-        changeWarning = '🚀 (حركة قوية)';
+        changeWarning = '🚀 (حركة انفجارية)';
     }
 
     let rrWarning = '';
@@ -514,13 +592,22 @@ function formatSingleOpportunity(opp, index) {
         valueText = '💰 القيمة السوقية: غير متاح';
     }
 
+    // الانفجار السعري
+    let explosionText = '';
+    if (opp.isExplosive) {
+        explosionText = `🔥 *انفجارة سعرية:* ✅ (${opp.explosion.details})`;
+    } else {
+        explosionText = `🔥 *انفجارة سعرية:* ❌`;
+    }
+
     let message =
-        `*${index}. 📈 ${safeSymbol}* ${categoryEmoji}\n` +
+        `*${index}. 📈 ${safeSymbol}* ${categoryEmoji}${opp.isExplosive ? '🔥' : ''} (${categoryText})\n` +
         `📌 *رمز الشركة:* ${safeSymbol}\n` +
         `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
         `📊 الفئة: ${categoryText}\n` +
         `🏆 التقييم: ${opp.score}/100\n` +
         `🎯 الثقة: ${opp.confidence}/10\n` +
+        `${explosionText}\n` +
         `${valueText}\n` +
         `💰 السعر: $${opp.price}\n` +
         `📈 التغير: ${opp.change}% ${changeWarning}\n` +
@@ -610,6 +697,9 @@ bot.on('callback_query', async (callbackQuery) => {
         if (analysis.marketCap) {
             message += `💰 القيمة السوقية: $${analysis.marketCap.marketCapBillion.toFixed(1)}B\n`;
         }
+        if (analysis.isExplosive) {
+            message += `🔥 انفجارة سعرية: ✅ (${analysis.explosion.details})\n`;
+        }
         message += `🎯 الدخول: $${analysis.entry}\n`;
         message += `🚀 الهدف: $${analysis.takeProfit}\n`;
         message += `🛑 وقف: $${analysis.stopLoss}\n`;
@@ -653,26 +743,50 @@ async function sendAutoOpportunities() {
         return;
     }
 
-    const topOpportunities = opportunities.slice(0, CONFIG.alertThreshold);
+    // تصفية الفرص المؤكدة فقط (3 دورات متتالية)
+    const confirmedOpportunities = [];
+    for (const opp of opportunities) {
+        const isConfirmed = await confirmOpportunity(opp.symbol, opp.score);
+        if (isConfirmed) {
+            confirmedOpportunities.push(opp);
+        }
+    }
+
+    if (confirmedOpportunities.length === 0) {
+        console.log('⏳ لا توجد فرص مؤكدة بعد (تحتاج 3 دورات متتالية)');
+        return;
+    }
+
+    const topOpportunities = confirmedOpportunities.slice(0, CONFIG.alertThreshold);
     const currentSymbols = topOpportunities.map(o => o.symbol).join(',');
     const lastSymbols = lastSentOpportunities.map(o => o.symbol).join(',');
 
     if (currentSymbols === lastSymbols && !isFirstRun) {
-        console.log('⏳ لا توجد فرص جديدة');
+        console.log('⏳ لا توجد فرص جديدة مؤكدة');
         return;
     }
 
     isFirstRun = false;
     lastSentOpportunities = topOpportunities;
 
-    const message = `🔔 *تنبيه تلقائي: ${topOpportunities.length} فرص جديدة!*\n` +
-                    `🕒 ${new Date().toLocaleTimeString()}\n` +
+    // توقيت محلي
+    const localTime = new Date();
+    const formattedTime = localTime.toLocaleString('ar-SA', {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: true
+    });
+
+    const message = `🔔 *تنبيه تلقائي: ${topOpportunities.length} فرص جديدة مؤكدة!*\n` +
+                    `🕒 ${formattedTime}\n` +
+                    `✅ تم تأكيد الفرص بعد 3 دورات متتالية\n` +
                     `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`;
 
     try {
         await bot.sendMessage(userId, message, { parse_mode: 'Markdown' });
         await sendOpportunities(userId, topOpportunities);
-        console.log('✅ تم إرسال التنبيه التلقائي');
+        console.log(`✅ تم إرسال التنبيه التلقائي (${formattedTime})`);
     } catch (error) {
         console.error('❌ فشل إرسال التنبيه:', error.message);
     }
@@ -682,17 +796,25 @@ async function sendAutoOpportunities() {
 bot.onText(/\/start|\/بدء/, (msg) => {
     const statusStocks = CONFIG.stocksOnly ? '🟢 مفعل' : '🔴 متوقف';
     const autoStatus = CONFIG.autoSend ? '🟢 مفعل' : '🔴 متوقف';
+    const localTime = new Date();
+    const formattedTime = localTime.toLocaleString('ar-SA', {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: true
+    });
 
     bot.sendMessage(msg.chat.id,
-        `🚀 *OPPORTUNITY HUNTER V3 - Full Market*\n` +
+        `🚀 *OPPORTUNITY HUNTER V3*\n` +
         `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
         `📈 *السوق الأمريكي:* ${statusStocks} (جميع الأسهم)\n` +
         `🔄 *تحديث القائمة:* كل ساعة\n` +
         `🔔 *التنبيهات:* ${autoStatus}\n` +
+        `🕒 *التوقيت المحلي:* ${formattedTime}\n` +
         `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
         `📋 *الأوامر:*\n` +
         `/فرص - عرض أفضل الفرص\n` +
-        `/تحليل [الرمز] - تحليل مفصل\n` +
+        `/تحليل [الرمز] - تحليل سهم\n` +
         `/اعدادات - إعدادات الأسواق\n` +
         `/اختبار - اختبار البوت\n` +
         `/احصائيات - إحصائيات الإشارات\n` +
@@ -701,8 +823,7 @@ bot.onText(/\/start|\/بدء/, (msg) => {
         `/تفعيل_تنبيه - تشغيل التنبيهات\n` +
         `/ايقاف_تنبيه - إيقاف التنبيهات\n` +
         `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
-        `📊 يغطي: NYSE + NASDAQ + AMEX (جميع الشركات)\n` +
-        `🔄 يتم تحديث القائمة تلقائياً كل ساعة`,
+        `📊 يغطي: NYSE + NASDAQ + AMEX (جميع الشركات)`,
         { parse_mode: 'Markdown' }
     );
 });
@@ -741,6 +862,9 @@ bot.onText(/\/تحليل (.+)/, async (msg, match) => {
     }
     if (analysis.marketCap) {
         message += `💰 القيمة السوقية: $${analysis.marketCap.marketCapBillion.toFixed(1)}B\n`;
+    }
+    if (analysis.isExplosive) {
+        message += `🔥 انفجارة سعرية: ✅ (${analysis.explosion.details})\n`;
     }
     message += `🎯 الدخول: $${analysis.entry}\n`;
     message += `🚀 الهدف: $${analysis.takeProfit}\n`;
@@ -830,7 +954,14 @@ bot.onText(/\/test|\/اختبار/, (msg) => {
 
 // ===== PERIODIC UPDATES =====
 async function periodicUpdate() {
-    console.log('🔄 تحديث دوري...');
+    const localTime = new Date();
+    const formattedTime = localTime.toLocaleString('ar-SA', {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: true
+    });
+    console.log(`🔄 تحديث دوري (${formattedTime})...`);
     await updateStockList();
     await scanMarket();
     console.log(`✅ تم تحديث ${allOpportunities.length} فرصة`);
@@ -842,17 +973,28 @@ setTimeout(sendAutoOpportunities, 30000);
 
 // ===== START =====
 async function init() {
-    console.log('🚀 OPPORTUNITY HUNTER V3 - Full US Market (Auto-Update)');
+    const localTime = new Date();
+    const formattedTime = localTime.toLocaleString('ar-SA', {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: true
+    });
+
+    console.log('🚀 OPPORTUNITY HUNTER V3');
+    console.log(`🕒 التوقيت المحلي: ${formattedTime}`);
     console.log('🔄 جاري تحميل جميع الأسهم الأمريكية...');
     await updateStockList();
     console.log(`✅ تم تحميل ${allStocksList.length} سهماً من السوق الأمريكي`);
     console.log(`🕌 نسبة التطهير المسموحة: ${CONFIG.purificationThreshold}%`);
     console.log(`🔄 تحديث القائمة كل ${CONFIG.updateInterval / 60000} دقيقة`);
+    console.log(`🔄 فحص السوق كل ${CONFIG.scanInterval / 1000} ثانية`);
+    console.log('✅ تأكيد الفرص بعد 3 دورات متتالية (6 دقائق)');
     await periodicUpdate();
-    console.log('✅ البوت يعمل! (جميع الأسهم الأمريكية مع تحديث تلقائي)');
+    console.log('✅ البوت يعمل!');
     
     try {
-        await bot.sendMessage(userId, '🔔 *تم تفعيل البوت النهائي!*\n✅ جميع أسهم السوق الأمريكي (NYSE + NASDAQ + AMEX)\n🔄 تحديث القائمة تلقائياً كل ساعة\n📈 إضافة مكرر الربحي والقيمة السوقية\n❌ تم إلغاء العملات المشفرة', { parse_mode: 'Markdown' });
+        await bot.sendMessage(userId, `🔔 *تم تفعيل البوت النهائي!*\n✅ جميع أسهم السوق الأمريكي\n🔄 تأكيد الفرص بعد 3 دورات\n📈 القيمة السوقية + مكرر الربحي\n🔥 كشف الانفجارات السعرية\n❌ تم إلغاء العملات المشفرة`, { parse_mode: 'Markdown' });
     } catch (error) {
         console.error('❌ فشل إرسال رسالة التأكيد:', error.message);
     }
