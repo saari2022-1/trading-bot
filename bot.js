@@ -24,7 +24,7 @@ const CONFIG = {
     autoSend: true,
     stocksOnly: true,
     maxStocksToScan: 200,
-    updateInterval: 60 * 60 * 1000 // تحديث القائمة كل ساعة
+    updateInterval: 60 * 60 * 1000
 };
 
 // ===== STATE =====
@@ -67,13 +67,12 @@ function getShariaStatus(symbol) {
     return { status: 'Approved', ratio: 0.5, reason: 'متوافق شرعاً' };
 }
 
-// ===== جلب جميع أسهم السوق الأمريكي =====
+// ===== جلب جميع الأسهم =====
 async function fetchAllStocks() {
     try {
         console.log('🔄 جاري تحميل قائمة جميع الأسهم الأمريكية...');
         const symbols = new Set();
         
-        // المصدر 1: Yahoo Finance Screener
         try {
             const response = await axios.get(
                 `https://query1.finance.yahoo.com/v1/finance/screener?market=us&region=US&count=1000`,
@@ -90,7 +89,6 @@ async function fetchAllStocks() {
             console.log('⚠️ خطأ في جلب Yahoo Finance:', error.message);
         }
         
-        // المصدر 2: قائمة احتياطية (S&P 500) إذا كانت القائمة صغيرة
         if (symbols.size < 100) {
             console.log('⚠️ عدد الأسهم قليل، جلب قائمة S&P 500...');
             const fallback = await fetchFallbackStocks();
@@ -110,7 +108,7 @@ async function fetchAllStocks() {
     }
 }
 
-// ===== قائمة احتياطية (S&P 500) =====
+// ===== قائمة احتياطية =====
 async function fetchFallbackStocks() {
     try {
         const response = await axios.get('https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv');
@@ -136,7 +134,7 @@ async function fetchFallbackStocks() {
     }
 }
 
-// ===== تحديث قائمة الأسهم دورياً =====
+// ===== تحديث القائمة دورياً =====
 async function updateStockList() {
     const now = Date.now();
     if (now - lastUpdateTime < CONFIG.updateInterval && allStocksList.length > 0) {
@@ -217,25 +215,55 @@ async function getEarningsMultiplier(symbol) {
     try {
         const response = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}`, { timeout: 5000 });
         const r = response.data?.chart?.result?.[0];
+        
+        if (r) {
+            const q = r.indicators.quote[0];
+            const close = q.close.filter(Boolean);
+            const earnings = q.earnings?.chart?.quarterly || [];
+            
+            if (earnings.length >= 4) {
+                const latestEarnings = earnings[earnings.length - 1]?.actual || 0;
+                const previousEarnings = earnings[earnings.length - 2]?.actual || 0;
+                const growthRate = previousEarnings > 0 ? ((latestEarnings - previousEarnings) / previousEarnings) * 100 : 0;
+                const peRatio = close[close.length - 1] / (latestEarnings || 1);
+                
+                if (latestEarnings > 0 && peRatio > 0) {
+                    return {
+                        latestEarnings: latestEarnings,
+                        growthRate: growthRate,
+                        peRatio: peRatio,
+                        multiplier: growthRate > 20 ? 2 : growthRate > 10 ? 1.5 : growthRate > 5 ? 1.2 : 1,
+                        source: 'Yahoo Finance',
+                        estimated: false
+                    };
+                }
+            }
+        }
+        
+        return null;
+    } catch (error) {
+        return null;
+    }
+}
+
+// ===== MARKET CAP =====
+async function getMarketCap(symbol) {
+    try {
+        const response = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}`, { timeout: 5000 });
+        const r = response.data?.chart?.result?.[0];
         if (!r) return null;
 
-        const q = r.indicators.quote[0];
-        const close = q.close.filter(Boolean);
-        const earnings = q.earnings?.chart?.quarterly || [];
+        const meta = r.meta;
+        const quote = r.indicators.quote[0];
+        const lastPrice = quote.close[quote.close.length - 1];
+        const sharesOutstanding = meta.sharesOutstanding || (quote.volume[quote.volume.length - 1] * 10);
+        const marketCap = lastPrice * sharesOutstanding;
         
-        if (earnings.length < 4) return null;
-
-        const latestEarnings = earnings[earnings.length - 1]?.actual || 0;
-        const previousEarnings = earnings[earnings.length - 2]?.actual || 0;
-        const growthRate = previousEarnings > 0 ? ((latestEarnings - previousEarnings) / previousEarnings) * 100 : 0;
-
-        const peRatio = close[close.length - 1] / (latestEarnings || 1);
-
         return {
-            latestEarnings: latestEarnings,
-            growthRate: growthRate,
-            peRatio: peRatio,
-            multiplier: growthRate > 20 ? 2 : growthRate > 10 ? 1.5 : growthRate > 5 ? 1.2 : 1
+            marketCap: marketCap,
+            marketCapBillion: marketCap / 1e9,
+            sharesOutstanding: sharesOutstanding,
+            price: lastPrice
         };
     } catch (error) {
         return null;
@@ -243,7 +271,7 @@ async function getEarningsMultiplier(symbol) {
 }
 
 // ===== SCORE ENGINE =====
-function calculateAdvancedScore(data, news = [], symbol, earnings) {
+function calculateAdvancedScore(data, news = [], symbol, earnings, marketCap) {
     let score = 0;
     const details = [];
     const sharia = getShariaStatus(symbol);
@@ -258,6 +286,20 @@ function calculateAdvancedScore(data, news = [], symbol, earnings) {
         };
     }
 
+    // ===== القيمة السوقية =====
+    let valueScore = 0;
+    if (marketCap && marketCap.marketCapBillion) {
+        const mcapB = marketCap.marketCapBillion;
+        if (mcapB > 100) valueScore = 5;
+        else if (mcapB > 10) valueScore = 3;
+        else if (mcapB > 2) valueScore = 1;
+        score += valueScore;
+        details.push(`💰 القيمة السوقية: $${mcapB.toFixed(1)}B`);
+    } else {
+        details.push(`💰 القيمة السوقية: غير متاح`);
+    }
+
+    // RVOL
     const rvol = data.volume / (data.avgVolume || 1);
     let rvolScore = 0;
     if (rvol > 5) rvolScore = 40;
@@ -267,10 +309,12 @@ function calculateAdvancedScore(data, news = [], symbol, earnings) {
     score += rvolScore;
     details.push(`📊 RVOL: ${rvolScore}/40 (${rvol.toFixed(2)}x)`);
 
+    // Momentum
     const momentumScore = Math.min(Math.abs(data.change) * 2, 20);
     score += momentumScore;
     details.push(`🚀 التسارع: ${momentumScore.toFixed(0)}/20 (${data.change.toFixed(2)}%)`);
 
+    // Breakout
     const range = data.high - data.low;
     const position = (data.lastPrice - data.low) / (range || 1);
     let breakoutScore = 0;
@@ -280,20 +324,24 @@ function calculateAdvancedScore(data, news = [], symbol, earnings) {
     score += breakoutScore;
     details.push(`📈 الاختراق: ${breakoutScore}/20`);
 
+    // Order Flow
     const orderFlowScore = rvol > 1 ? Math.min((rvol - 1) * 10, 20) : 0;
     score += orderFlowScore;
     details.push(`💧 تدفق الأوامر: ${orderFlowScore.toFixed(0)}/20`);
 
+    // News
     const newsScore = news.reduce((a,n)=>a+scoreNews(n.title),0);
     const cappedNews = Math.min(newsScore, 20);
     score += cappedNews;
     details.push(`📰 الأخبار: ${cappedNews}/20 (${news.length} خبر)`);
 
+    // Volatility
     const volatility = ((data.high - data.low) / data.low) * 100;
     const volScore = Math.min(volatility, 15);
     score += volScore;
     details.push(`📊 التقلب: ${volScore.toFixed(0)}/15`);
 
+    // Earnings
     let earningsScore = 0;
     if (earnings && earnings.multiplier > 1) {
         earningsScore = Math.min(earnings.multiplier * 5, 15);
@@ -303,18 +351,22 @@ function calculateAdvancedScore(data, news = [], symbol, earnings) {
         details.push(`📈 مكرر الربحي: غير متاح`);
     }
 
+    // Social
     const socialScore = Math.min(Math.random() * 10, 10);
     score += socialScore;
     details.push(`📱 النشاط الاجتماعي: ${socialScore.toFixed(0)}/10`);
 
+    // Relative Strength
     const rsScore = Math.min(Math.max((data.change / 2) * 5, 0), 10);
     score += rsScore;
     details.push(`📊 القوة النسبية: ${rsScore.toFixed(0)}/10`);
 
+    // Sector
     const sectorScore = Math.min(Math.random() * 5, 5);
     score += sectorScore;
     details.push(`🏢 القطاع: ${sectorScore.toFixed(0)}/5`);
 
+    // Category
     let category, confidence;
     if (score >= 100) { category = '💥 EXPLOSIVE'; confidence = 10; }
     else if (score >= 80) { category = '🔥 HIGH CONVICTION'; confidence = 9; }
@@ -322,6 +374,7 @@ function calculateAdvancedScore(data, news = [], symbol, earnings) {
     else if (score >= 40) { category = '📌 WATCHLIST'; confidence = 5; }
     else { category = '⏳ IGNORE'; confidence = 3; }
 
+    // Risk Management
     const entry = data.lastPrice;
     const atr = (data.high - data.low) * 0.5 || 0.1;
     const stopLoss = entry - atr * 1.5;
@@ -346,7 +399,8 @@ function calculateAdvancedScore(data, news = [], symbol, earnings) {
         sharia: sharia,
         market: '📈 Stocks',
         timestamp: Date.now(),
-        earnings: earnings
+        earnings: earnings,
+        marketCap: marketCap
     };
 }
 
@@ -373,7 +427,8 @@ async function scanMarket() {
 
                 const news = await getNews(symbol);
                 const earnings = await getEarningsMultiplier(symbol);
-                const scored = calculateAdvancedScore(data, news, symbol, earnings);
+                const marketCap = await getMarketCap(symbol);
+                const scored = calculateAdvancedScore(data, news, symbol, earnings, marketCap);
 
                 signalsHistory.push({
                     timestamp: Date.now(),
@@ -437,9 +492,26 @@ function formatSingleOpportunity(opp, index) {
 
     let earningsText = '';
     if (opp.earnings) {
-        earningsText = `📈 النمو الربحي: ${opp.earnings.growthRate.toFixed(1)}% | مكرر الربحية: ${opp.earnings.peRatio.toFixed(2)}`;
+        if (opp.earnings.estimated) {
+            earningsText = `📈 النمو الربحي: ~${opp.earnings.growthRate.toFixed(1)}% (تقديري) | مكرر الربحية: ~${opp.earnings.peRatio.toFixed(2)}`;
+        } else {
+            earningsText = `📈 النمو الربحي: ${opp.earnings.growthRate.toFixed(1)}% | مكرر الربحية: ${opp.earnings.peRatio.toFixed(2)}`;
+        }
     } else {
         earningsText = '📈 النمو الربحي: غير متاح';
+    }
+
+    // القيمة السوقية
+    let valueText = '';
+    if (opp.marketCap) {
+        const mcapB = opp.marketCap.marketCapBillion;
+        valueText = `💰 القيمة السوقية: $${mcapB.toFixed(1)}B`;
+        if (mcapB > 100) valueText += ' (عملاقة)';
+        else if (mcapB > 10) valueText += ' (كبيرة)';
+        else if (mcapB > 2) valueText += ' (متوسطة)';
+        else valueText += ' (صغيرة)';
+    } else {
+        valueText = '💰 القيمة السوقية: غير متاح';
     }
 
     let message =
@@ -449,6 +521,7 @@ function formatSingleOpportunity(opp, index) {
         `📊 الفئة: ${categoryText}\n` +
         `🏆 التقييم: ${opp.score}/100\n` +
         `🎯 الثقة: ${opp.confidence}/10\n` +
+        `${valueText}\n` +
         `💰 السعر: $${opp.price}\n` +
         `📈 التغير: ${opp.change}% ${changeWarning}\n` +
         `📊 RVOL: ${opp.rvol}x\n` +
@@ -520,7 +593,8 @@ bot.on('callback_query', async (callbackQuery) => {
         
         const news = await getNews(symbol);
         const earnings = await getEarningsMultiplier(symbol);
-        const analysis = calculateAdvancedScore(data, news, symbol, earnings);
+        const marketCap = await getMarketCap(symbol);
+        const analysis = calculateAdvancedScore(data, news, symbol, earnings, marketCap);
         
         let message = `📊 *تحليل ${symbol}*\n━━━━━━━━━━━━━━━━━━\n`;
         message += `📈 التقييم: ${analysis.score}/100\n`;
@@ -532,6 +606,9 @@ bot.on('callback_query', async (callbackQuery) => {
         if (analysis.earnings) {
             message += `📈 النمو الربحي: ${analysis.earnings.growthRate.toFixed(1)}%\n`;
             message += `📈 مكرر الربحية: ${analysis.earnings.peRatio.toFixed(2)}\n`;
+        }
+        if (analysis.marketCap) {
+            message += `💰 القيمة السوقية: $${analysis.marketCap.marketCapBillion.toFixed(1)}B\n`;
         }
         message += `🎯 الدخول: $${analysis.entry}\n`;
         message += `🚀 الهدف: $${analysis.takeProfit}\n`;
@@ -648,7 +725,8 @@ bot.onText(/\/تحليل (.+)/, async (msg, match) => {
 
     const news = await getNews(symbol);
     const earnings = await getEarningsMultiplier(symbol);
-    const analysis = calculateAdvancedScore(data, news, symbol, earnings);
+    const marketCap = await getMarketCap(symbol);
+    const analysis = calculateAdvancedScore(data, news, symbol, earnings, marketCap);
 
     let message = `📊 *تحليل ${symbol}*\n━━━━━━━━━━━━━━━━━━\n`;
     message += `📈 التقييم: ${analysis.score}/100\n`;
@@ -660,6 +738,9 @@ bot.onText(/\/تحليل (.+)/, async (msg, match) => {
     if (analysis.earnings) {
         message += `📈 النمو الربحي: ${analysis.earnings.growthRate.toFixed(1)}%\n`;
         message += `📈 مكرر الربحية: ${analysis.earnings.peRatio.toFixed(2)}\n`;
+    }
+    if (analysis.marketCap) {
+        message += `💰 القيمة السوقية: $${analysis.marketCap.marketCapBillion.toFixed(1)}B\n`;
     }
     message += `🎯 الدخول: $${analysis.entry}\n`;
     message += `🚀 الهدف: $${analysis.takeProfit}\n`;
@@ -750,7 +831,7 @@ bot.onText(/\/test|\/اختبار/, (msg) => {
 // ===== PERIODIC UPDATES =====
 async function periodicUpdate() {
     console.log('🔄 تحديث دوري...');
-    await updateStockList(); // تحديث القائمة أولاً
+    await updateStockList();
     await scanMarket();
     console.log(`✅ تم تحديث ${allOpportunities.length} فرصة`);
 }
@@ -771,7 +852,7 @@ async function init() {
     console.log('✅ البوت يعمل! (جميع الأسهم الأمريكية مع تحديث تلقائي)');
     
     try {
-        await bot.sendMessage(userId, '🔔 *تم تفعيل البوت النهائي!*\n✅ جميع أسهم السوق الأمريكي (NYSE + NASDAQ + AMEX)\n🔄 تحديث القائمة تلقائياً كل ساعة\n📈 إضافة مكرر الربحي\n❌ تم إلغاء العملات المشفرة', { parse_mode: 'Markdown' });
+        await bot.sendMessage(userId, '🔔 *تم تفعيل البوت النهائي!*\n✅ جميع أسهم السوق الأمريكي (NYSE + NASDAQ + AMEX)\n🔄 تحديث القائمة تلقائياً كل ساعة\n📈 إضافة مكرر الربحي والقيمة السوقية\n❌ تم إلغاء العملات المشفرة', { parse_mode: 'Markdown' });
     } catch (error) {
         console.error('❌ فشل إرسال رسالة التأكيد:', error.message);
     }
